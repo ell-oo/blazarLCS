@@ -1,0 +1,976 @@
+import pyLCR
+import os
+import urllib
+import json
+import numpy as np
+import io
+import sys
+import math
+from statistics import mode
+
+import astropy
+from astropy.table import Table, Column
+from astropy.time import Time
+from astropy.io import fits
+import pandas as pd
+import array as arr
+
+from pyLCR.DataTools import getLightCurve
+from pyLCR.PlottingTools import plotLightCurve
+from pyLCR.PlottingTools import computeDate
+from pyLCR.PlottingTools import getCurrentMET
+from pyLCR.PlottingTools import computeMJD
+from pyLCR.Sources import sources
+
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from astropy.stats import bayesian_blocks
+import qb
+import hop
+
+from astropy.coordinates import SkyCoord, get_sun
+import astropy.units as u
+from astropy import coordinates as coords
+
+
+
+#dictionaries  
+list_of_bad_indexes = {} #to track data that should be filtered out
+good_flux = {} #filtered fluxes per source
+good_errs = {} #errors of the filtered fluxes per source
+good_dets = {} #times associated with each filtered flux (MJD) per source
+list_of_good_names =[] #list of names (sources) that had data tracked by pyLCR thus were filtered
+all_blocked_flux={} #blocked fluxes per source
+all_edges={} #edges of the bluxes per source
+all_blocked_errs={} #errors of the blocked flux per source
+quiescent_baseline = {} #ground flux (quiescent baseline) per source
+list_of_good_flares_hop= {} #5x QB hop algo
+list_of_bad_indexes = {} #to track data that should be filtered out
+list_of_solar_indexes = {} # to track when we remove MJDs that overlap with the sun
+list_of_good_flares ={} #5x QB
+num_of_flares_per_source={}
+num_of_flares=[]
+time_elapsed = {}
+ids = {} #in flare state
+#rise/decay
+peak_time_per_flare = {} 
+peak_flux_per_flare = {}
+rise_time = {} #during flare
+decay_time = {} #during flare
+classes = {} #(FSRQ BL LAC BCU)
+redshift ={}
+#asymmetry
+asym_fsrq={}
+asym_fsrq_all=[]
+asym_bll={}
+asym_bll_all=[]
+asym_bcu={}
+asym_bcu_all=[]
+asym_no_info={} #asym of agn candidate sources 
+asym_no_info_all=[]
+asym={}
+avg_asym={}
+#amplitude
+amplitude={}
+amp_list=[]
+amp_fsrq=[]
+amp_bll=[]
+amp_bcu=[]
+amp_no_info=[]#amp of agn candidate sources
+avg_amp={}
+
+
+
+
+
+  #Filter too bright idx, ts outliars, 5 degrees of the sun 
+
+H = fits.open('table-4LAC-DR3-h.fits')
+H_names = H[1].data['Source_Name']
+L = fits.open('table-4LAC-DR3-l.fits')
+L_names = L[1].data['Source_Name']
+
+def filter_data(n):
+    
+    #creat list inside dictionary
+    list_of_bad_indexes[n] = np.array([], dtype=int)
+    list_of_solar_indexes[n] = np.array([], dtype=int)
+    
+    if n in H_names:
+        idx = np.where(H_names == n)[0]
+        ra, dec = H[1].data[idx]['RA_Counterpart'], H[1].data[idx]['DEC_Counterpart']
+    elif n in L_names:
+        idx = np.where(L_names == n)[0]
+        ra, dec = L[1].data[idx]['RA_Counterpart'], L[1].data[idx]['DEC_Counterpart']
+    else:
+        #example name: '4FGL J0222.6+4302'
+        temp_name = n.replace('4FGL J', '')
+        #example name becomes: 0222.6+4302 ==> 02:22:30 +43:02:__ 
+        ra_temp = temp_name[:2]+':'+temp_name[2:6]#+':'+str((float(temp_name[5])*60))  #temp_name[:6]
+        dec_temp = temp_name[6:9]+':'+temp_name[9:] #temp_name[-5:]
+        pos = SkyCoord(ra=ra_temp, dec=dec_temp, unit=(u.hourangle, u.deg), frame='icrs')
+        ra, dec = pos.ra.degree, pos.dec.degree
+
+    #print(type(n))#make sure data is being read as str
+    #check if the sourse contains data
+    data = pyLCR.getLightCurve(n, cadence='daily', flux_type='photon', index_type='fixed', ts_min=1)
+    if data is None:
+        return()  
+    else:
+      # Access and print the 'flux_error' attribute if data is not None
+        if hasattr(data, 'flux_error'):
+            data.ts = data.ts[data.ts >= 1]
+            bad_ids = np.where(data.flux >= 1e-5)[0]#first filter for if a source is too bright
+            list_of_bad_indexes[n]= np.append(list_of_bad_indexes[n],bad_ids)#append the too bright indexes to our bad indexes
+            
+            pos = SkyCoord(ra*u.deg, dec*u.deg, frame='icrs')
+            
+            for t in range(1, len(data.met_detections)-1):#nested loop with reference to time
+                time = Time(convert_mjds(data.met_detections[t]), format='mjd')
+                loc_of_sun = get_sun(time) #now check if sourse is too close to sun
+                sep = pos.separation(loc_of_sun, origin_mismatch="ignore")
+                if t in list_of_bad_indexes[n]:
+                    pass
+               
+                elif (data.flux[t]/(data.flux_error[t][1]-data.flux[t]))**2 > 300*data.ts[t]:#find outliars
+                    list_of_bad_indexes[n]= np.append(list_of_bad_indexes[n],t)#add to bad list
+                elif (data.flux[t]/(data.flux_error[t][0]-data.flux[t]))**2 > 300*data.ts[t]:
+                    list_of_bad_indexes[n]= np.append(list_of_bad_indexes[n],t)
+                elif sep <= 5*u.deg:
+                    list_of_bad_indexes[n]= np.append(list_of_bad_indexes[n],t) 
+                    list_of_solar_indexes[n] = np.append(list_of_solar_indexes[n], t)#indexes within 5 degrees of the sun
+                    
+            
+            #make data type bool where bad indexes is false  
+            mask = np.ones(len(data.flux), dtype=bool)
+            mask[list_of_bad_indexes[n]] = False #make them hidden
+            #print('Number of bad indexes:')
+            #print(len(list_of_bad_indexes[n]))
+            #make 'good' data what is left when bad inexes are masked
+            good_flux[n]= data.flux[mask]
+            good_errs[n]= data.flux_error[mask]
+            good_dets[n]=convert_mjds(data.met_detections[mask])
+            list_of_good_names.append(str(n))
+            #print('Number of good flux bins:')
+            #print (len(good_flux[n]))
+        else:
+            return()
+
+        return()  
+
+def convert_mjds(mets):
+    '''
+    Same as before!
+    '''
+    met_start=239889601 #start of survey in secs
+    mjd_start=54686.5 #start in days
+    mjd_values=((mets-met_start)/86400)+mjd_start #conversion
+    return (mjd_values)#days not seconds 
+
+
+
+
+
+  def block_good_fluxes(times, fluxes, errors):
+ 
+   
+    edges = bayesian_blocks(times, fluxes, sigma=(errors.max(axis=1)-fluxes),fitness='measures')
+    blocked_flux = []
+    blocked_errs = []
+    blocked_edges = []
+    try:
+        quiescent_baseline = np.median(qb.find_quiet(fluxes))
+        #quiescent_baseline[n] = np.median(qb.find_quiet(good_flux[n]))
+    except:
+        quiescent_baseline = np.median(fluxes)
+        #quiescent_baseline[n] = np.median(good_flux[n])
+        
+    for i in range(len(edges) - 1):
+        
+        temp_errs = errors[(times >= edges[i]) & (times < edges[i+1])][:,0]
+        temp_flux= fluxes[(times >= edges[i]) & (times < edges[i+1])] 
+        #temp_errs = good_errs[name][(good_dets[name] >= edges[i]) & (good_dets[name] < edges[i+1])][:,0]
+        #temp_flux= good_flux[name][(good_dets[name] >= edges[i]) & (good_dets[name] < edges[i+1])]
+        temp_errs-=temp_flux
+        if len(temp_errs)<1:
+            pass
+                
+        else: 
+            #prop errs
+            weights= 1/temp_errs**2
+            weighted_mean= np.average(temp_flux,weights=weights)
+            weighted_error= np.sqrt(1/np.sum(weights))
+            blocked_flux.append(weighted_mean)
+            blocked_errs.append(weighted_error)
+            blocked_edges.append(edges[i])
+                
+    blocked_edges.append(edges[-1])
+    blocked_edges= np.array(blocked_edges)
+    blocked_flux = np.array(blocked_flux)
+    blocked_errs= np.array(blocked_errs)
+    
+    #all_blocked_flux[name]= blocked_flux
+    #all_edges[name]= blocked_edges
+    #all_blocked_errs[name]= blocked_errs
+    return(blocked_edges, blocked_flux, blocked_errs, quiescent_baseline)
+        
+def plot_blocks_vs_data(names, num_of_cols=2):
+    '''
+    This function only takes the list of names you want to plot;
+    it assumes that there is already a dictionary of filtered data 
+    (good_dets, good_flux, good_errs) that includes every name 
+    from the list of names that you gave it.
+    
+    It also assumes there is already a dictionary of blocked data 
+    (all_blocked_flux, all_edges) for every name as well.
+    
+    Finally, it assumes that there is also a dictionary of the quiscent
+    flux (quiescent_baseline) for every name as well.
+    
+    This will make a plot that is 2 columns wide, and is therefore half
+    as long as all the data you want to plot. If you are plotting more
+    than ~20 sources, I recommmend increasing the number of columns
+    (and therefore also decreasing the number of rows). This is why I've
+    added the variable num_of_cols, which is set to a default of 2,
+    but when you call the function you can just set num_of_cols=3 (or anything!).
+    Every time you increase the # of columns, you divide the # of rows
+    by the same amount - this is hard-coded into the first line.
+    '''
+    fig, ax = plt.subplots(int(len(names)/num_of_cols), num_of_cols, figsize=(12,20), dpi=200,sharex=True)
+    # Uncommment the following line if you want to plot the original data for this source
+    #orig = pyLCR.getLightCurve(name, cadence='daily', flux_type='photon', index_type='fixed', ts_min=1, verbose=False)
+    j=0
+    m=0 #start collums at 0
+    for name in names:
+        #ax[j,m].plot(orig.met_detections, orig.flux, color='blue', alpha=0.7)
+        ax[j,m].errorbar(good_dets[name], good_flux[name], yerr=good_errs[name].max(axis=1)-good_flux[name], fmt='.', elinewidth=1, color='grey',alpha=0.2) 
+        ax[j,m].stairs(all_blocked_flux[name], edges=all_edges[name], fill=False, zorder=3, color='black')
+        ax[j,m].text(.01,.9,name,transform=ax[j, m].transAxes)
+        ax[j,m].axhline(quiescent_baseline[name], color='hotpink', linestyle='--', zorder=10)
+        j += 1 #next row
+        if j == int(len(names)/2):
+            m=1 #switch collum
+            j=0 #restart 0
+            if m == num_of_cols:
+                break
+
+    fig.subplots_adjust(wspace=0.1, hspace=0.0)
+    plt.show()
+
+
+def flare_counting(blocked_flux_array,qb):
+   
+    if (len(blocked_flux_array))!=1:
+    
+        loc_of_flares=hop.hop(blocked_flux_array)
+        good_flare= np.where(blocked_flux_array> 5* np.median(qb))[0]
+        overlapping_ids = sorted(list(set(loc_of_flares) & set(good_flare)))
+    else:
+
+        overlapping_ids=[]
+   
+        
+    return (overlapping_ids)
+    list_of_good_flares_hop[name]=np.array(overlapping_ids)
+
+
+
+
+
+
+  list_of_blazars = np.genfromtxt('fgl4_dr2_blazars.dat', delimiter=',', dtype=str) #read in data
+
+names = list_of_blazars[::10]
+#names=strong_flares
+
+#names=np.append(names,'4FGL J0001.5+2113')
+
+
+
+
+
+  #This cell uses our created function, filter_data, to find and save
+#the good, filtered data of every source in a dictionary, 
+#where every dictionary entry (by using [n]) is the source.
+
+
+
+for n in names:
+    filter_data(n)
+
+#list_of_good_names = np.array(list_of_good_names)
+
+
+
+
+print(len(list_of_solar_indexes))
+
+
+#This cell uses our created function, block_good_fluxes, to find and save
+#the Bayesian Block details and quiescent baseline of every source
+#in a dictionary, where every dictionary entry (by using [n]) is the source.
+
+
+for n in names:
+    if n not in good_flux: 
+        continue    
+    else:
+        all_edges[n], all_blocked_flux[n], all_blocked_errs[n], quiescent_baseline[n] = block_good_fluxes(good_dets[n], good_flux[n], good_errs[n])
+
+
+
+
+#This cell plots the raw, blocked, and quiescent data for each source.
+
+# I'm doing everything but the last source because our list happens to be an odd number
+# right now, and I don't want the last source over-plotting on top of other data.
+
+plot_blocks_vs_data(list_of_good_names[:-1])
+
+
+
+
+
+
+list_of_good_flares ={} 
+num_of_flares_per_source={}
+num_of_flares=[]
+            
+
+for n in list_of_good_names:
+    ids_of_flares=flare_counting(all_blocked_flux[n],quiescent_baseline[n])
+    num_of_flares_per_source[n]=(len(ids_of_flares))
+    num_of_flares.append(len(ids_of_flares))
+    list_of_good_flares[n]=ids_of_flares
+    
+
+    
+plt.figure()   
+plt.hist(num_of_flares,bins=range(max(num_of_flares)+1),color='black')
+plt.ylabel('number of sources')
+plt.xlabel('number of flares per source')
+
+
+
+
+
+
+  hdulist = [fits.PrimaryHDU()]  # Start with an empty primary HDU
+
+for name in list_of_good_names:  # Loop over your blazar sources
+    # Filtered data table
+    cols_filt = [
+        fits.Column(name='MJD', array=good_dets[name], format='E'),
+        fits.Column(name='Flux', array=good_flux[name], format='E'),
+        fits.Column(name='Error_lower', array=good_errs[name][:,0], format='E'),
+        fits.Column(name='Error_upper', array=good_errs[name][:,1], format='E')
+    ]
+    hdu_filt = fits.BinTableHDU.from_columns(cols_filt, name=f'{name}_FILTERED')
+
+    # Bayesian block data table
+    if len(all_edges[name]) > 0:
+        cols_blocked = [
+            fits.Column(name='Edge', array=np.array(all_edges[name]), format='E'),
+            fits.Column(name='Flux', array=np.array(all_blocked_flux[name]), format='E'),
+            fits.Column(name='Error', array=np.array(all_blocked_errs[name]), format='E')
+            ]
+        hdu_blocked = fits.BinTableHDU.from_columns(cols_blocked, name=f'{name}_BLOCKED')
+    else:
+        cols_blocked = [
+            fits.Column(name='Edge', array=np.array([]), format='E'),
+            fits.Column(name='Flux', array=np.array([]), format='E'),
+            fits.Column(name='Error', array=np.array([]), format='E')
+            ]
+        hdu_blocked = fits.BinTableHDU.from_columns(cols_blocked, name=f'{name}_BLOCKED')
+    # Add to HDU list
+    hdulist.extend([hdu_filt, hdu_blocked])
+
+# Write to disk
+fits.HDUList(hdulist).writeto('blazar_lightcurves.fits', overwrite=True)
+
+
+
+
+
+
+
+  # Counting IDs and total time elapsed per flare
+time_elapsed = {}
+ids = {}
+
+def flare_duration(random_name, threshold_factor=5):  
+   
+    qb = threshold_factor * quiescent_baseline[random_name]
+    flux = all_blocked_flux[random_name]
+    edges = all_edges[random_name]
+    
+    ids = []
+    time_elapsed = []
+    in_flare = False
+    
+
+    for i in range(len(flux)):
+        above = flux[i] > qb
+        at_last = i == len(flux) - 1
+
+        if above and not in_flare:
+            # Flare starts
+            start_idx = i
+            in_flare = True
+            ids.append(i)
+
+        if in_flare and (not above or at_last):
+            # Flare ends — either we dropped below or hit the end
+            end_idx = i + 1 if above and at_last else i
+            time_elapsed.append(edges[end_idx] - edges[start_idx]) #time elapsed
+            ids.append(end_idx)
+            in_flare = False
+
+    return np.array(ids), np.array(time_elapsed)
+    
+
+for random_name in list_of_good_flares:
+  
+        ids[random_name], time_elapsed[random_name] = flare_duration(random_name, threshold_factor=5) 
+        
+
+
+
+
+
+
+
+#rise/decay
+peak_time_per_flare = {} 
+peak_flux_per_flare = {}
+rise_time = {}
+decay_time = {}
+
+for random_name in list_of_good_flares:
+    peak_time_per_flare[random_name] = []
+    peak_flux_per_flare[random_name] = []
+    rise_time[random_name] = []
+    decay_time[random_name] = []
+       
+    qb = 5 * quiescent_baseline[random_name] #"threashold factor qb"
+
+    i=2 #discard flares at first or last index if over threashold
+    while i <= (len(ids[random_name])-1):
+        # find peak #v line for plot flare tic mark
+        v_line=np.argmax(all_blocked_flux[random_name][ids[random_name][i]:ids[random_name][i+1]+1])
+        loc_of_v_line= all_edges[random_name][ids[random_name][i]:ids[random_name][i+1]+1][v_line]
+        loc_of_v_line_next= all_edges[random_name][ids[random_name][i]:ids[random_name][i+1]+1][v_line+1]
+        loc_of_plot=np.mean([loc_of_v_line,loc_of_v_line_next])   #center the line in peak block
+  
+        peak_time_per_flare[random_name].append(loc_of_plot)
+        peak_flux_per_flare[random_name].append(max(all_blocked_flux[random_name][ids[random_name][i]:ids[random_name][i+1]+1]))
+        # rise and decay time from peak  
+        rise_time[random_name].append(loc_of_plot - min(all_edges[random_name][ids[random_name][i]:ids[random_name][i+1]+1]))
+        decay_time[random_name].append(max(all_edges[random_name][ids[random_name][i]:ids[random_name][i+1]+1]) - loc_of_plot)
+           
+        i+=2
+
+    rise_time[random_name] = np.array(rise_time[random_name]) 
+    decay_time[random_name] = np.array(decay_time[random_name])
+
+
+
+
+
+
+
+#plotting
+for random_name in list_of_good_flares:
+    #if len(list_of_good_flares[random_name])>: # filter plots by # of flares per source
+    fig, ax = plt.subplots(1,1, figsize=(8,5), dpi=200)
+    qb = 5 * quiescent_baseline[random_name] #"threashold factor qb"
+    ax.errorbar(good_dets[random_name], good_flux[random_name],
+                    yerr=good_errs[random_name].max(axis=1)-good_flux[random_name],
+                    marker='.', color='k', alpha=0.05, label='Raw Data')
+    ax.stairs(all_blocked_flux[random_name], edges=all_edges[random_name],
+                  fill=False, zorder=3, color='black', label='Blocked Data')
+    ax.text(0.02, 0.95, random_name, transform=ax.transAxes)
+    ax.axhline(qb/5, color='green', alpha=0.4, linestyle='--', zorder=10, label='Quiescent Baseline')
+    ax.axhline(qb, color='darkblue', alpha=0.4, linestyle=':', zorder=10, label='Flare Threshold')
+        #ax.set_xlim(57500, 57600)
+    i = 0
+    while i <= (len(ids[random_name])-1):
+        v_line=np.argmax(all_blocked_flux[random_name][ids[random_name][i]:ids[random_name][i+1]+1])
+        loc_of_v_line= all_edges[random_name][ids[random_name][i]:ids[random_name][i+1]+1][v_line]
+        loc_of_v_line_next= all_edges[random_name][ids[random_name][i]:ids[random_name][i+1]+1][v_line+1]
+        loc_of_plot=np.mean([loc_of_v_line,loc_of_v_line_next])
+        if i == 0:
+            ax.axvspan(all_edges[random_name][ids[random_name][i]],
+                           all_edges[random_name][ids[random_name][i+1]],
+                           alpha=0.2, color='yellow', label='Flare')
+            ax.axvline(loc_of_plot, ymax=0.05, color='red',linewidth=.5, label='Flare Peak')
+        else:
+            ax.axvspan(all_edges[random_name][ids[random_name][i]],
+                           all_edges[random_name][ids[random_name][i+1]],
+                           alpha=0.2, color='yellow')
+            ax.axvline(loc_of_plot, ymax=0.05, color='red',linewidth=.5)
+        i += 2
+    print(rise_time[random_name])
+    print(decay_time[random_name])
+    ax.legend(framealpha=1)
+    plt.show()   # check 4FGL J2158.1-1501 0.75 
+
+
+
+
+
+
+H = fits.open('table-4LAC-DR3-h.fits')
+L = fits.open('table-4LAC-DR3-l.fits') #h and l are galactic disc loc
+same_name_h = [] 
+same_name_l = []
+classes = {}
+redshift ={}
+
+#for class type
+for i in range(len(H[1].data)):
+    catalog_name_h = H[1].data[i]['Source_Name']
+    class_type = H[1].data[i]['class']
+    
+    if catalog_name_h in list_of_good_flares:
+        class_type = class_type.lower()
+        same_name_h.append(catalog_name_h)
+        classes[catalog_name_h] = class_type
+        redh = H[1].data[i]['redshift']#for red shift
+        redshift[catalog_name_h]=redh
+
+for i in range(len(L[1].data)):
+    catalog_name_l = L[1].data[i]['Source_Name']
+    class_type = L[1].data[i]['class']
+    if catalog_name_l in list_of_good_flares:
+        class_type = class_type.lower()
+        same_name_l.append(catalog_name_l)
+        classes[catalog_name_l] = class_type
+        redl = L[1].data[i]['redshift']#for red shift
+        redshift[catalog_name_l]=redl
+
+all_same_name = same_name_h + same_name_l
+print(len(all_same_name))
+print(len(list_of_good_names))
+print(len(redshift))
+
+
+
+
+
+
+
+
+# rise/decay scatter plot for classes
+fig, ax = plt.subplots(1,1, figsize=(8,5), dpi=200)
+fsrq=0
+bll=0
+bcu=0
+nci=0
+
+for random_name in all_same_name:
+    
+    if classes[random_name] == 'fsrq':
+        
+        if len(rise_time[random_name]) > 0:
+            
+            fsrq+=1
+            if fsrq==1:
+                ax.scatter(rise_time[random_name],decay_time[random_name],color='black',alpha=.3,marker=".",label='FSRQ')
+            else:ax.scatter(rise_time[random_name],decay_time[random_name],color='black',alpha=.3,marker=".")
+            
+    elif classes[random_name] == 'bll':
+        
+        if len(rise_time[random_name]) > 0:
+            bll+=1 
+            if bll==1:
+                ax.scatter(rise_time[random_name],decay_time[random_name],color='red',alpha=.3, marker="v",label='BL LAC')
+            else:
+                ax.scatter(rise_time[random_name],decay_time[random_name],color='red',alpha=.3, marker="v")
+           
+            
+    elif classes[random_name] == 'bcu':
+        
+        
+        if len(rise_time[random_name]) > 0:
+            
+            bcu+=1
+            if bcu==1:
+                ax.scatter(rise_time[random_name],decay_time[random_name],color='blue',alpha=.3,marker="d",label='BCU')
+            else:
+                ax.scatter(rise_time[random_name],decay_time[random_name],color='blue',alpha=.3,marker="d")
+
+for random_name in list_of_good_names:
+    
+    if random_name not in all_same_name:
+        if len(rise_time[random_name]) > 0:
+            nci+=1
+            if nci==1:
+                ax.scatter(rise_time[random_name],decay_time[random_name],color='green',alpha=.3,marker="*", label='No Class Info')
+#plt.xlim(0, 5) 
+#plt.ylim(0,10)
+ax.set_xlabel('Rise Time')
+ax.set_ylabel('Decay Time')
+ax.legend(framealpha=1)
+plt.show()
+
+
+
+
+
+
+#asymmetry and aplitude
+
+asym_fsrq={}
+asym_fsrq_all=[]
+asym_bll={}
+asym_bll_all=[]
+asym_bcu={}
+asym_bcu_all=[]
+asym_no_info={}
+asym_no_info_all=[]
+asym={}
+for random_name in list_of_good_flares:
+    asym[random_name]=[]
+    A=(rise_time[random_name]-decay_time[random_name])/(rise_time[random_name]+decay_time[random_name])
+    if random_name in all_same_name:
+       
+    
+        if classes[random_name] == 'fsrq':
+            asym_fsrq[random_name]=A
+            asym_fsrq_all.extend(A)
+            asym[random_name].extend(A)
+    
+        elif classes[random_name] == 'bll':
+            asym_bll[random_name]=A
+            asym_bll_all.extend(A)
+            asym[random_name].extend(A)
+
+        elif classes[random_name] == 'bcu':
+            asym_bcu[random_name]=A
+            asym_bcu_all.extend(A)
+            asym[random_name].extend(A)
+
+    else:
+        asym_no_info[random_name]=A
+        asym_no_info_all.extend(A)
+        asym[random_name].extend(A)
+
+amplitude={}
+amp_list=[]
+amp_fsrq=[]
+amp_bll=[]
+amp_bcu=[]
+amp_no_info=[]
+
+   
+for random_name in list_of_good_flares: #list_of_good_flares_hop
+    amplitude[random_name] = []
+    i = 2
+    while i < len(ids[random_name]) - 1:
+        #print(ids[random_name][i]) # just to check we’re getting actual ids where flares start
+        max_flux=np.max(all_blocked_flux[random_name][ids[random_name][i]:ids[random_name][i+1]+1])
+        amp = max_flux / quiescent_baseline[random_name]
+        amplitude[random_name].append(amp)
+        amp_list.append(amp)
+        if random_name in all_same_name:
+            if classes[random_name] == 'fsrq':
+                amp_fsrq.append(amp)
+            elif classes[random_name] == 'bll':
+                amp_bll.append(amp)
+            elif classes[random_name] == 'bcu':
+                amp_bcu.append(amp)
+        else:
+            amp_no_info.append(amp)
+        i += 2
+
+
+
+
+
+
+
+
+ #make list of asymmetry for each class and plot hist of class lists #overplot visual
+
+
+plt.figure()
+
+for random_name in all_same_name:
+   if classes[random_name] == 'fsrq':
+       
+       plt.hist(asym_fsrq[random_name],color='black',alpha=.3)
+        
+plt.figure()
+
+for random_name in all_same_name:
+    if classes[random_name] == 'bll':
+        plt.hist(asym_bll[random_name],color='red',alpha=.3)
+
+plt.figure()
+
+for random_name in all_same_name:
+    if classes[random_name] == 'bcu':
+    
+        plt.hist(asym_bcu[random_name],color='blue',alpha=.3)
+
+plt.figure()
+
+for random_name in asym_no_info:
+    
+        plt.hist(asym_no_info[random_name],color='green',alpha=.3)
+        
+
+plt.show()
+
+
+
+
+
+  #asym hist no overplot
+'''plt.figure
+plt.hist(asym,label='All Sources',color='orange')
+plt.legend()
+plt.show()'''
+
+plt.figure
+plt.hist(asym_fsrq_all,label='FSRQ',color='black')
+plt.legend()
+plt.show()
+
+
+plt.figure
+plt.hist(asym_bcu_all,label='BCU',color='blue')
+plt.legend()
+plt.show()
+
+plt.figure
+plt.hist(asym_bll_all,label='BLL',color='red')
+plt.legend()
+plt.show()
+
+plt.figure
+plt.hist(asym_no_info_all,label='NO INFO',color='green')
+plt.legend()
+plt.show()
+
+
+
+
+#hist amplitude  
+    
+plt.figure
+plt.hist(amp_list,label='All Sources',color='orange',bins=50)
+plt.legend()
+plt.show()
+
+plt.figure
+plt.hist(amp_fsrq,label='FSRQ',color='black',bins=30)
+plt.legend()
+plt.show()
+
+
+plt.figure
+plt.hist(amp_bcu,label='BCU',color='blue')
+plt.legend()
+plt.show()
+
+
+plt.figure
+plt.hist(amp_bll,label='BLL',color='red')
+plt.legend()
+plt.show()
+
+
+plt.figure
+plt.hist(amp_no_info,label='NO INFO',color='green')
+plt.legend()
+plt.show()
+
+
+
+
+
+#asymmetry amplitude scatter plot
+fig, ax = plt.subplots(1,1, figsize=(8,5), dpi=200)
+fsrq_=0
+bll_=0
+bcu_=0
+nci_=0
+for random_name in list_of_good_flares:
+    if random_name in all_same_name:
+         if classes[random_name] == 'fsrq':
+          
+              if len(rise_time[random_name]) > 0:
+              
+                  fsrq_+=1 
+                  if fsrq_==1:
+                     ax.scatter(asym_fsrq[random_name],amplitude[random_name],color='black',alpha=.3,marker=".",label='FSRQ')
+                  else:
+                  
+                     ax.scatter(asym_fsrq[random_name],amplitude[random_name],color='black',alpha=.3,marker=".")
+            
+         elif classes[random_name] == 'bll':
+         
+             if len(rise_time[random_name]) > 0:
+             
+                bll_+=1 
+                if bll_==1:
+                     ax.scatter(asym_bll[random_name],amplitude[random_name],color='red',alpha=.3, marker="v",label='BL LAC')
+                else:
+                     ax.scatter(asym_bll[random_name],amplitude[random_name],color='red',alpha=.3, marker="v")
+             
+           
+         elif classes[random_name] == 'bcu':
+             if len(rise_time[random_name]) > 0:
+                 bcu_+=1
+                 if bcu_==1:
+                 
+                     ax.scatter(asym_bcu[random_name],amplitude[random_name],color='blue',alpha=.3,marker="d", label='BCU')
+                 else:
+                     ax.scatter(asym_bcu[random_name],amplitude[random_name],color='blue',alpha=.3,marker="d")
+
+    else:
+    
+        if len(rise_time[random_name]) > 0:
+            nci_+=1
+            if nci_==1:
+                ax.scatter(asym_no_info[random_name],amplitude[random_name],color='green',alpha=.3,marker="*", label= 'Candidate Source')
+            else:
+                ax.scatter(asym_no_info[random_name],amplitude[random_name],color='green',alpha=.3,marker="*")
+ax.set_xlabel('Asymmetry')
+ax.set_ylabel('Amplitude')
+ax.legend(framealpha=1)
+ax.set_yscale('log')
+plt.show()
+
+
+
+
+
+
+avg_amp={}
+avg_asym={}
+for random_name in list_of_good_names:
+    avg_amp[random_name]=np.mean(amplitude[random_name])
+    avg_asym[random_name]=np.mean(asym[random_name])
+
+
+
+
+
+  #avg asym amp scaled data points
+fig, ax = plt.subplots(1,1, figsize=(8,5), dpi=200)
+fsrq__=0
+bll__=0
+bcu__=0
+nci__=0
+for random_name in list_of_good_flares:
+    if random_name in all_same_name:
+         if classes[random_name] == 'fsrq':
+          
+              if len(rise_time[random_name]) > 0:
+                  if avg_amp[random_name]>100:
+                    print([random_name])
+                  fsrq__+=1 
+                  if fsrq__==1:
+                     ax.scatter(avg_asym[random_name],avg_amp[random_name],marker='o',color='black',alpha=.5,s=6*num_of_flares_per_source[random_name],label='FSRQ')
+                  else:
+                  
+                     ax.scatter(avg_asym[random_name],avg_amp[random_name],marker='o',color='black',alpha=.5,s=6*num_of_flares_per_source[random_name])
+            
+         elif classes[random_name] == 'bll':
+         
+             if len(rise_time[random_name]) > 0:
+                if avg_amp[random_name]>100:
+                    print([random_name])
+                bll__+=1 
+                if bll__==1:
+                    ax.scatter(avg_asym[random_name],avg_amp[random_name],marker='o',color='red',alpha=.5,s=6*num_of_flares_per_source[random_name],label='BL LAC')
+                else:
+                     ax.scatter(avg_asym[random_name],avg_amp[random_name],marker='o',color='red',alpha=.5,s=6*num_of_flares_per_source[random_name])
+             
+           
+         elif classes[random_name] == 'bcu':
+             if len(rise_time[random_name]) > 0:
+                 bcu__+=1
+                 if bcu__==1:
+                 
+                      ax.scatter(avg_asym[random_name],avg_amp[random_name],marker='o',color='blue',alpha=.5,s=6*num_of_flares_per_source[random_name],label='BCU')
+                 else:
+                     ax.scatter(avg_asym[random_name],avg_amp[random_name],marker='o',color='blue',alpha=.5,s=6*num_of_flares_per_source[random_name])
+
+    else:
+    
+        if len(rise_time[random_name]) > 0:
+            nci__+=1
+            if nci__==1:
+                ax.scatter(avg_asym[random_name],avg_amp[random_name],marker='o',color='green',alpha=.5,s=6*num_of_flares_per_source[random_name], label= 'Candidate Source')
+            else:
+                ax.scatter(avg_asym[random_name],avg_amp[random_name],marker='o',color='green',alpha=.5,s=6*num_of_flares_per_source[random_name])
+
+
+
+ax.set_yscale('log')
+ax.set_xlabel('Average Asymmetry per Source')
+ax.set_ylabel('Average Amplitude per Source')
+ax.legend(framealpha=1)
+plt.show()
+
+
+
+
+
+
+  #Scatter plot of flare amplitude vs. redshift of the source 
+fig, ax = plt.subplots(1,1, figsize=(8,5), dpi=200)
+fsrq__=0
+bll__=0
+bcu__=0
+
+for random_name in redshift:
+    
+    if redshift[random_name] == '-inf':
+        redshift[random_name] = np.nan
+    
+
+for random_name in all_same_name:
+    
+        
+    if classes[random_name] == 'fsrq':
+         
+         
+            if len(rise_time[random_name]) > 0:
+                fsrq__+=1
+                if fsrq__==1:
+              
+                    ax.scatter(redshift[random_name],np.mean(amplitude[random_name]),color='black',alpha=.3,marker=".", label='FSRQ')
+                else:
+                    ax.scatter(redshift[random_name],np.mean(amplitude[random_name]),color='black',alpha=.3,marker=".")
+            
+    elif classes[random_name] == 'bll':
+             
+        if len(rise_time[random_name]) > 0:
+            
+            bll__+=1
+            if bll__==1:
+                ax.scatter(redshift[random_name],np.mean(amplitude[random_name]),color='red',alpha=.3, marker="v",label='BL LAC')
+            else:
+                ax.scatter(redshift[random_name],np.mean(amplitude[random_name]),color='red',alpha=.3, marker="v")
+           
+    elif classes[random_name] == 'bcu':
+        if len(rise_time[random_name]) > 0:
+            bcu__+=1
+            if bcu__==1:
+                ax.scatter(redshift[random_name],np.mean(amplitude[random_name]),color='blue',alpha=.3,marker="d",label='BCU')
+            else:
+               ax.scatter(redshift[random_name],np.mean(amplitude[random_name]),color='blue',alpha=.3,marker="d") 
+ax.set_xlabel('Redshift')
+ax.set_ylabel('Amplitude')
+ax.legend(framealpha=1)
+plt.show()
+
+
+
+
+
